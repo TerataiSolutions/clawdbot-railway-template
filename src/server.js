@@ -15,23 +15,12 @@ for (const suffix of ["PUBLIC_PORT", "STATE_DIR", "WORKSPACE_DIR", "GATEWAY_TOKE
   const newKey = `OPENCLAW_${suffix}`;
   if (process.env[oldKey] && !process.env[newKey]) {
     process.env[newKey] = process.env[oldKey];
-    // Best-effort compatibility shim for old Railway templates.
-    // Intentionally no warning: Railway templates can still set legacy keys and warnings are noisy.
   }
-  // Avoid forwarding legacy variables into OpenClaw subprocesses.
-  // OpenClaw logs a warning when deprecated CLAWDBOT_* variables are present.
   delete process.env[oldKey];
 }
 
-// Railway injects PORT at runtime and routes traffic to that port.
-// Do not force a different public port in the container image, or the service may
-// boot but the Railway domain will be routed to a different port.
-//
-// OPENCLAW_PUBLIC_PORT is kept as an escape hatch for non-Railway deployments.
 const PORT = Number.parseInt(process.env.PORT ?? process.env.OPENCLAW_PUBLIC_PORT ?? "3000", 10);
 
-// State/workspace
-// OpenClaw defaults to ~/.openclaw.
 const STATE_DIR =
   process.env.OPENCLAW_STATE_DIR?.trim() ||
   path.join(os.homedir(), ".openclaw");
@@ -40,11 +29,8 @@ const WORKSPACE_DIR =
   process.env.OPENCLAW_WORKSPACE_DIR?.trim() ||
   path.join(STATE_DIR, "workspace");
 
-// Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
-// Gateway admin token (protects OpenClaw gateway + Control UI).
-// Must be stable across restarts. If not provided via env, persist it in the state dir.
 function resolveGatewayToken() {
   const envTok = process.env.OPENCLAW_GATEWAY_TOKEN?.trim();
   if (envTok) return envTok;
@@ -70,12 +56,10 @@ function resolveGatewayToken() {
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 
-// Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10);
 const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
 
-// Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
 const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
@@ -99,7 +83,6 @@ function configPath() {
       // ignore
     }
   }
-  // Default to canonical even if it doesn't exist yet.
   return candidates[0] || path.join(STATE_DIR, "openclaw.json");
 }
 
@@ -111,10 +94,7 @@ function isConfigured() {
   }
 }
 
-// One-time migration: rename legacy config files to openclaw.json so existing
-// deployments that still have the old filename on their volume keep working.
 (function migrateLegacyConfigFile() {
-  // If the operator explicitly chose a config path, do not rename files in STATE_DIR.
   if (process.env.OPENCLAW_CONFIG_PATH?.trim()) return;
 
   const canonical = path.join(STATE_DIR, "openclaw.json");
@@ -137,7 +117,6 @@ function isConfigured() {
 let gatewayProc = null;
 let gatewayStarting = null;
 
-// Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
 let lastGatewayExit = null;
 let lastDoctorOutput = null;
@@ -152,12 +131,10 @@ async function waitForGatewayReady(opts = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      // Try the default Control UI base path, then fall back to root.
       const paths = ["/openclaw", "/"];
       for (const p of paths) {
         try {
           const res = await fetch(`${GATEWAY_TARGET}${p}`, { method: "GET" });
-          // Any HTTP response means the port is open.
           if (res) return true;
         } catch {
           // try next
@@ -216,7 +193,6 @@ async function startGateway() {
 }
 
 async function runDoctorBestEffort() {
-  // Avoid spamming `openclaw doctor` in a crash loop.
   const now = Date.now();
   if (lastDoctorAt && now - lastDoctorAt < 5 * 60 * 1000) return;
   lastDoctorAt = now;
@@ -245,7 +221,6 @@ async function ensureGatewayRunning() {
       } catch (err) {
         const msg = `[gateway] start failure: ${String(err)}`;
         lastGatewayError = msg;
-        // Collect extra diagnostics to help users file issues.
         await runDoctorBestEffort();
         throw err;
       }
@@ -264,7 +239,6 @@ async function restartGateway() {
     } catch {
       // ignore
     }
-    // Give it a moment to exit and release the port.
     await sleep(750);
     gatewayProc = null;
   }
@@ -303,8 +277,6 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
 
 async function probeGateway() {
-  // Don't assume HTTP — the gateway primarily speaks WebSocket.
-  // A simple TCP connect check is enough for "is it up".
   const net = await import("node:net");
 
   return await new Promise((resolve) => {
@@ -354,14 +326,36 @@ app.get("/healthz", async (_req, res) => {
   });
 });
 
+// Proxy /webhook to internal AOF webhook listener on port 18792.
+// Supabase posts to https://openclaw-production-8a49.up.railway.app/webhook
+// and this forwards the request internally without exposing a new public port.
+app.post("/webhook", (req, res) => {
+  import("node:http").then(({ default: http }) => {
+    const options = {
+      hostname: "127.0.0.1",
+      port: 18792,
+      path: "/",
+      method: "POST",
+      headers: req.headers,
+    };
+    const proxy = http.request(options, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res, { end: true });
+    });
+    proxy.on("error", (e) => {
+      console.error("[webhook proxy] error:", e.message);
+      res.status(502).json({ error: "Webhook listener unavailable" });
+    });
+    req.pipe(proxy, { end: true });
+  });
+});
+
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
-  // Serve JS for /setup (kept external to avoid inline encoding/template issues)
   res.type("application/javascript");
   res.send(fs.readFileSync(path.join(process.cwd(), "src", "setup-app.js"), "utf8"));
 });
 
 app.get("/setup", requireSetupAuth, (_req, res) => {
-  // No inline <script>: serve JS from /setup/app.js to avoid any encoding/template-literal issues.
   res.type("html").send(`<!doctype html>
 <html>
 <head>
@@ -518,7 +512,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     <p class="muted">Reset deletes the OpenClaw config file so you can rerun onboarding. Pairing approval lets you grant DM access when dmPolicy=pairing.</p>
 
     <details style="margin-top: 0.75rem">
-      <summary><strong>Pairing helper</strong> (for “disconnected (1008): pairing required”)</summary>
+      <summary><strong>Pairing helper</strong> (for "disconnected (1008): pairing required")</summary>
       <p class="muted">This lists pending device requests and lets you approve them without SSH.</p>
       <button id="devicesRefresh" style="background:#0f172a">Refresh pending devices</button>
       <div id="devicesList" class="muted" style="margin-top:0.5rem"></div>
@@ -605,7 +599,6 @@ function buildOnboardArgs(payload) {
     "--skip-health",
     "--workspace",
     WORKSPACE_DIR,
-    // The wrapper owns public networking; keep the gateway internal.
     "--gateway-bind",
     "loopback",
     "--gateway-port",
@@ -621,7 +614,6 @@ function buildOnboardArgs(payload) {
   if (payload.authChoice) {
     args.push("--auth-choice", payload.authChoice);
 
-    // Map secret to correct flag for common choices.
     const secret = (payload.authSecret || "").trim();
     const map = {
       "openai-api-key": "--openai-api-key",
@@ -640,9 +632,6 @@ function buildOnboardArgs(payload) {
 
     const flag = map[payload.authChoice];
 
-    // If the user picked an API-key auth choice but didn't provide a secret, fail fast.
-    // Otherwise OpenClaw may fall back to its default auth choice, which looks like the
-    // wizard "reverted" their selection.
     if (flag && !secret) {
       throw new Error(`Missing auth secret for authChoice=${payload.authChoice}`);
     }
@@ -652,7 +641,6 @@ function buildOnboardArgs(payload) {
     }
 
     if (payload.authChoice === "token") {
-      // This is the Anthropic setup-token flow.
       if (!secret) throw new Error("Missing auth secret for authChoice=token");
       args.push("--token-provider", "anthropic", "--token", secret);
     }
@@ -736,26 +724,18 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
   const ok = onboard.code === 0 && isConfigured();
 
-  // Optional setup (only after successful onboarding).
   if (ok) {
-    // Ensure gateway token is written into config so the browser UI can authenticate reliably.
-    // (We also enforce loopback bind since the wrapper proxies externally.)
-    // IMPORTANT: Set both gateway.auth.token (server-side) and gateway.remote.token (client-side)
-    // to the same value so the Control UI can connect without "token mismatch" errors.
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
 
-    // Railway runs behind a reverse proxy. Trust loopback as a proxy hop so local client detection
-    // remains correct when X-Forwarded-* headers are present.
     await runCmd(
       OPENCLAW_NODE,
       clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"]) ]),
     );
 
-    // Optional: configure a custom OpenAI-compatible provider (base URL) for advanced users.
     if (payload.customProviderId?.trim() && payload.customProviderBaseUrl?.trim()) {
       const providerId = payload.customProviderId.trim();
       const baseUrl = payload.customProviderBaseUrl.trim();
@@ -779,7 +759,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           models: modelId ? [{ id: modelId, name: modelId }] : undefined,
         };
 
-        // Ensure we merge in this provider rather than replacing other providers.
         await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "models.mode", "merge"]));
         const set = await runCmd(
           OPENCLAW_NODE,
@@ -798,7 +777,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       if (!supports("telegram")) {
         extra += "\n[telegram] skipped (this openclaw build does not list telegram in `channels add --help`)\n";
       } else {
-        // Avoid `channels add` here (it has proven flaky across builds); write config directly.
         const token = payload.telegramToken.trim();
         const cfgObj = {
           enabled: true,
@@ -812,8 +790,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           clawArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(cfgObj)]),
         );
         const get = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.telegram"]));
-
-        // Best-effort: enable the telegram plugin explicitly (some builds require this even when configured).
         const plug = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "telegram"]));
 
         extra += `\n[telegram config] exit=${set.code} (output ${set.output.length} chars)\n${set.output || "(no output)"}`;
@@ -864,15 +840,11 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
     }
 
-    // Apply changes immediately.
     await restartGateway();
 
-    // Ensure OpenClaw applies any "configured but not enabled" channel/plugin changes.
-    // This makes Telegram/Discord pairing issues much less "silent".
     const fix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
     extra += `\n[doctor --fix] exit=${fix.code} (output ${fix.output.length} chars)\n${fix.output || "(no output)"}`;
 
-    // Doctor may require a restart depending on changes.
     await restartGateway();
   }
 
@@ -890,7 +862,6 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
   const help = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
 
-  // Channel config checks (redact secrets before returning to client)
   const tg = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.telegram"]));
   const dc = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.discord"]));
 
@@ -942,16 +913,12 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   });
 });
 
-// --- Debug console (Option A: allowlisted commands + config editor) ---
-
 function redactSecrets(text) {
   if (!text) return text;
-  // Very small best-effort redaction. (Config paths/values may still contain secrets.)
   return String(text)
     .replace(/(sk-[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
     .replace(/(gho_[A-Za-z0-9_]{10,})/g, "[REDACTED]")
     .replace(/(xox[baprs]-[A-Za-z0-9-]{10,})/g, "[REDACTED]")
-    // Telegram bot tokens look like: 123456:ABCDEF...
     .replace(/(\d{5,}:[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
     .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
 }
@@ -967,24 +934,17 @@ function extractDeviceRequestIds(text) {
 }
 
 const ALLOWED_CONSOLE_COMMANDS = new Set([
-  // Wrapper-managed lifecycle
   "gateway.restart",
   "gateway.stop",
   "gateway.start",
-
-  // OpenClaw CLI helpers
   "openclaw.version",
   "openclaw.status",
   "openclaw.health",
   "openclaw.doctor",
   "openclaw.logs.tail",
   "openclaw.config.get",
-
-  // Device management (for fixing "disconnected (1008): pairing required")
   "openclaw.devices.list",
   "openclaw.devices.approve",
-
-  // Plugin management
   "openclaw.plugins.list",
   "openclaw.plugins.enable",
 ]);
@@ -1043,7 +1003,6 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
     }
 
-    // Device management commands (for fixing "disconnected (1008): pairing required")
     if (cmd === "openclaw.devices.list") {
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
@@ -1060,7 +1019,6 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
     }
 
-    // Plugin management commands
     if (cmd === "openclaw.plugins.list") {
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "list"]));
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
@@ -1100,7 +1058,6 @@ app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
     fs.mkdirSync(STATE_DIR, { recursive: true });
 
     const p = configPath();
-    // Backup
     if (fs.existsSync(p)) {
       const backupPath = `${p}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
       fs.copyFileSync(p, backupPath);
@@ -1108,7 +1065,6 @@ app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
 
     fs.writeFileSync(p, content, { encoding: "utf8", mode: 0o600 });
 
-    // Apply immediately.
     if (isConfigured()) {
       await restartGateway();
     }
@@ -1128,7 +1084,6 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: r.output });
 });
 
-// Device pairing helper (list + approve) to avoid needing SSH.
 app.get("/setup/api/devices/pending", requireSetupAuth, async (_req, res) => {
   const r = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
   const output = redactSecrets(r.output);
@@ -1145,10 +1100,7 @@ app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
 });
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
-  // Reset: stop gateway (frees memory) + delete config file(s) so /setup can rerun.
-  // Keep credentials/sessions/workspace by default.
   try {
-    // Stop gateway to avoid running gateway + onboard concurrently on small Railway instances.
     try {
       if (gatewayProc) {
         try { gatewayProc.kill("SIGTERM"); } catch {}
@@ -1180,8 +1132,6 @@ app.get("/setup/export", requireSetupAuth, async (_req, res) => {
     `attachment; filename="openclaw-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz"`,
   );
 
-  // Prefer exporting from a common /data root so archives are easy to inspect and restore.
-  // This preserves dotfiles like /data/.openclaw/openclaw.json.
   const stateAbs = path.resolve(STATE_DIR);
   const workspaceAbs = path.resolve(WORKSPACE_DIR);
 
@@ -1193,7 +1143,6 @@ app.get("/setup/export", requireSetupAuth, async (_req, res) => {
 
   if (underData(stateAbs) && underData(workspaceAbs)) {
     cwd = dataRoot;
-    // We export relative to /data so the archive contains: .openclaw/... and workspace/...
     paths = [
       path.relative(dataRoot, stateAbs) || ".",
       path.relative(dataRoot, workspaceAbs) || ".",
@@ -1228,11 +1177,8 @@ function isUnderDir(p, root) {
 
 function looksSafeTarPath(p) {
   if (!p) return false;
-  // tar paths always use / separators
   if (p.startsWith("/") || p.startsWith("\\")) return false;
-  // windows drive letters
   if (/^[A-Za-z]:[\\/]/.test(p)) return false;
-  // path traversal
   if (p.split("/").includes("..")) return false;
   return true;
 }
@@ -1255,8 +1201,6 @@ async function readBodyBuffer(req, maxBytes) {
   });
 }
 
-// Import a backup created by /setup/export.
-// This is intentionally limited to restoring into /data to avoid overwriting arbitrary host paths.
 app.post("/setup/import", requireSetupAuth, async (req, res) => {
   try {
     const dataRoot = "/data";
@@ -1267,19 +1211,15 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
         .send("Import is only supported when OPENCLAW_STATE_DIR and OPENCLAW_WORKSPACE_DIR are under /data (Railway volume).\n");
     }
 
-    // Stop gateway before restore so we don't overwrite live files.
     if (gatewayProc) {
       try { gatewayProc.kill("SIGTERM"); } catch {}
       await sleep(750);
       gatewayProc = null;
     }
 
-    const buf = await readBodyBuffer(req, 250 * 1024 * 1024); // 250MB max
+    const buf = await readBodyBuffer(req, 250 * 1024 * 1024);
     if (!buf.length) return res.status(400).type("text/plain").send("Empty body\n");
 
-    // Extract into /data.
-    // We only allow safe relative paths, and we intentionally do NOT delete existing files.
-    // (Users can reset/redeploy or manually clean the volume if desired.)
     const tmpPath = path.join(os.tmpdir(), `openclaw-import-${Date.now()}.tar.gz`);
     fs.writeFileSync(tmpPath, buf);
 
@@ -1290,14 +1230,12 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
       strict: true,
       onwarn: () => {},
       filter: (p) => {
-        // Allow only paths that look safe.
         return looksSafeTarPath(p);
       },
     });
 
     try { fs.rmSync(tmpPath, { force: true }); } catch {}
 
-    // Restart gateway after restore.
     if (isConfigured()) {
       await restartGateway();
     }
@@ -1328,13 +1266,11 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
-// --- Dashboard password protection ---
-// Require the same SETUP_PASSWORD for the entire Control UI dashboard,
-// not just the /setup routes.  Healthcheck is excluded so Railway probes work.
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
-  if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
-  if (!SETUP_PASSWORD) return next(); // no password configured → open
+  if (req.path.startsWith("/hooks")) return next();
+  if (req.path === "/webhook") return next(); // allow Supabase webhook posts through without dashboard auth
+  if (!SETUP_PASSWORD) return next();
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
   if (scheme !== "Basic" || !encoded) {
@@ -1351,10 +1287,6 @@ function requireDashboardAuth(req, res, next) {
   return next();
 }
 
-// --- Gateway token injection ---
-// The gateway is only reachable from this container. The Control UI in the browser
-// cannot set custom Authorization headers for WebSocket connections, so we inject
-// the token into proxied requests at the wrapper level.
 function attachGatewayAuthHeader(req) {
   if (!req?.headers?.authorization && OPENCLAW_GATEWAY_TOKEN) {
     req.headers.authorization = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
@@ -1366,7 +1298,6 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
-  // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
   }
@@ -1396,7 +1327,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
   console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
 
-  // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
   try {
     fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true });
   } catch {}
@@ -1410,9 +1340,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
   }
 
-  // Optional operator hook to install/persist extra tools under /data.
-  // This is intentionally best-effort and should be used to set up persistent
-  // prefixes (npm/pnpm/python venv), not to mutate the base image.
   const bootstrapPath = path.join(WORKSPACE_DIR, "bootstrap.sh");
   if (fs.existsSync(bootstrapPath)) {
     console.log(`[wrapper] running bootstrap: ${bootstrapPath}`);
@@ -1431,9 +1358,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     }
   }
 
-  // Sync gateway tokens in config with the current env var on every startup.
-  // This prevents "gateway token mismatch" when OPENCLAW_GATEWAY_TOKEN changes
-  // (e.g. Railway variable update) but the config file still has the old value.
   if (isConfigured() && OPENCLAW_GATEWAY_TOKEN) {
     console.log("[wrapper] syncing gateway tokens in config...");
     try {
@@ -1446,8 +1370,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     }
   }
 
-  // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
-  // work even if nobody visits the web UI.
   if (isConfigured()) {
     console.log("[wrapper] config detected; starting gateway...");
     try {
@@ -1460,10 +1382,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
-  // Note: browsers cannot attach arbitrary HTTP headers (including Authorization: Basic)
-  // in WebSocket handshakes. Do not enforce dashboard Basic auth at the upgrade layer.
-  // The gateway authenticates at the protocol layer and we inject the gateway token below.
-
   if (!isConfigured()) {
     socket.destroy();
     return;
@@ -1479,14 +1397,12 @@ server.on("upgrade", async (req, socket, head) => {
 });
 
 process.on("SIGTERM", () => {
-  // Best-effort shutdown
   try {
     if (gatewayProc) gatewayProc.kill("SIGTERM");
   } catch {
     // ignore
   }
 
-  // Stop accepting new connections; allow in-flight requests to complete briefly.
   try {
     server.close(() => process.exit(0));
   } catch {
