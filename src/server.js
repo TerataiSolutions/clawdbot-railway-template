@@ -329,14 +329,19 @@ app.get("/healthz", async (_req, res) => {
 // Proxy /webhook to internal AOF webhook listener on port 18792.
 // Supabase posts to https://openclaw-production-8a49.up.railway.app/webhook
 // and this forwards the request internally without exposing a new public port.
-app.post("/webhook", (req, res) => {
+app.post("/webhook", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
   import("node:http").then(({ default: http }) => {
+    const bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+    const headers = {
+      ...req.headers,
+      "content-length": bodyBuffer.length,
+    };
     const options = {
       hostname: "127.0.0.1",
       port: 18792,
       path: "/",
       method: "POST",
-      headers: req.headers,
+      headers,
     };
     const proxy = http.request(options, (proxyRes) => {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
@@ -346,7 +351,8 @@ app.post("/webhook", (req, res) => {
       console.error("[webhook proxy] error:", e.message);
       res.status(502).json({ error: "Webhook listener unavailable" });
     });
-    req.pipe(proxy, { end: true });
+    proxy.write(bodyBuffer);
+    proxy.end();
   });
 });
 
