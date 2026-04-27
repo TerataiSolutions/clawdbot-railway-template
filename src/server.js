@@ -1,5 +1,6 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
+import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
