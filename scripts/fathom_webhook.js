@@ -10,6 +10,7 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const COHERE_API_KEY = process.env.COHERE_API_KEY;
 const OPENCLAW_API_URL = process.env.OPENCLAW_API_URL || "http://localhost:8080/v1/chat/completions";
 const DISCORD_WEBHOOK_URL = process.env.AETHER_DISCORD_WEBHOOK_URL;
+const FETCH_TIMEOUT_MS = 30000; // 30 second timeout for external API calls
 
 let clientMap = {};
 try {
@@ -29,6 +30,24 @@ function logJson(level, message, data = {}) {
     ...data,
   };
   console.log(JSON.stringify(log));
+}
+
+// ── Timeout Wrapper ──────────────────────────────────────────────────
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return response;
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Fetch timeout after ${timeoutMs}ms to ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ── Signature Verification ──────────────────────────────────────────
@@ -58,7 +77,9 @@ async function generateEmbedding(text, inputType = "search_document") {
     throw new Error("COHERE_API_KEY not set");
   }
 
-  const response = await fetch("https://api.cohere.ai/v1/embed", {
+  logJson("info", "generateEmbedding_start", { text_length: text.length, input_type: inputType });
+
+  const response = await fetchWithTimeout("https://api.cohere.ai/v1/embed", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -72,10 +93,12 @@ async function generateEmbedding(text, inputType = "search_document") {
   });
 
   if (!response.ok) {
-    throw new Error(`Cohere API error: ${response.statusText}`);
+    const error = await response.text().catch(() => response.statusText);
+    throw new Error(`Cohere API error: ${response.status} ${response.statusText} - ${error}`);
   }
 
   const data = await response.json();
+  logJson("info", "generateEmbedding_success");
   return data.embeddings[0];
 }
 
@@ -89,6 +112,8 @@ async function saveMemoryWithEmbedding(memory) {
   if (memory.type.startsWith("client_") && !memory.client_id) {
     throw new Error(`Memory type ${memory.type} requires client_id`);
   }
+
+  logJson("info", "saveMemory_start", { type: memory.type, client_id: memory.client_id });
 
   let embedding;
   try {
@@ -110,7 +135,9 @@ async function saveMemoryWithEmbedding(memory) {
     embedding,
   };
 
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/memories`, {
+  logJson("info", "saveMemory_inserting_to_supabase", { url: SUPABASE_URL });
+
+  const response = await fetchWithTimeout(`${SUPABASE_URL}/rest/v1/memories`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -126,6 +153,7 @@ async function saveMemoryWithEmbedding(memory) {
   }
 
   const saved = await response.json();
+  logJson("info", "saveMemory_success", { memory_id: saved[0]?.id });
   return saved[0];
 }
 
@@ -215,7 +243,7 @@ async function detectIcpDrift(clientId, plainText) {
     });
 
     if (DISCORD_WEBHOOK_URL) {
-      await fetch(DISCORD_WEBHOOK_URL, {
+      await fetchWithTimeout(DISCORD_WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -233,7 +261,7 @@ async function summarizeExecutiveSync(plainText, meetingType) {
     return;
   }
 
-  const response = await fetch(OPENCLAW_API_URL, {
+  const response = await fetchWithTimeout(OPENCLAW_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -268,7 +296,7 @@ async function extractStrategyInputs(clientId, plainText, meetingType) {
     return;
   }
 
-  const response = await fetch(OPENCLAW_API_URL, {
+  const response = await fetchWithTimeout(OPENCLAW_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -324,6 +352,8 @@ const server = http.createServer(async (req, res) => {
     });
     req.on("end", async () => {
       try {
+        logJson("info", "webhook_request_received", { body_length: body.length });
+
         if (WEBHOOK_SECRET && !verifySignature(req, body)) {
           logJson("warn", "fathom_webhook_invalid_signature");
           res.writeHead(401);
@@ -397,6 +427,7 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         logJson("error", "fathom_webhook_error", {
           error: err.message,
+          stack: err.stack,
         });
         res.writeHead(500);
         res.end(JSON.stringify({ error: "Processing failed" }));
