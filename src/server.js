@@ -360,12 +360,19 @@ app.post("/webhook", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
 // ── Fathom webhook proxy routes ──────────────────────────────────────
 
 app.post("/api/fathom/webhook", (req, res) => {
+  const bodyBuffer = req.body
+    ? Buffer.from(JSON.stringify(req.body))
+    : Buffer.alloc(0);
   const options = {
     hostname: "127.0.0.1",
     port: 4242,
     path: "/fathom/webhook",
     method: "POST",
-    headers: req.headers,
+    headers: {
+      ...req.headers,
+      "content-type": "application/json",
+      "content-length": bodyBuffer.length,
+    },
   };
   const proxyReq = http.request(options, (proxyRes) => {
     res.statusCode = proxyRes.statusCode;
@@ -375,7 +382,8 @@ app.post("/api/fathom/webhook", (req, res) => {
     console.error("[Fathom Proxy] Error:", err.message);
     res.status(502).json({ error: "Webhook server unavailable" });
   });
-  req.pipe(proxyReq);
+  proxyReq.write(bodyBuffer);
+  proxyReq.end();
 });
 
 app.get("/api/fathom/health", (_req, res) => {
@@ -1476,3 +1484,4 @@ process.on("SIGTERM", () => {
 
   setTimeout(() => process.exit(0), 5_000).unref?.();
 });
+
