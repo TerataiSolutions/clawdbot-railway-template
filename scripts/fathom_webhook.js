@@ -29,9 +29,21 @@ function verifySignature(req, body) {
   const webhookTimestamp = req.headers["webhook-timestamp"];
   const webhookSignature = req.headers["webhook-signature"];
   if (!webhookId || !webhookTimestamp || !webhookSignature) return false;
+  const timestamp = parseInt(webhookTimestamp, 10);
+  const currentTimestamp = Math.floor(Date.now() / 1000);
+  if (Math.abs(currentTimestamp - timestamp) > 300) return false;
   const signedContent = `${webhookId}.${webhookTimestamp}.${body}`;
-  const hash = crypto.createHmac("sha256", WEBHOOK_SECRET).update(signedContent).digest("base64");
-  return hash === webhookSignature;
+  const secretBytes = Buffer.from(WEBHOOK_SECRET.split("_")[1], "base64");
+  const expectedSignature = crypto.createHmac("sha256", secretBytes).update(signedContent).digest("base64");
+  const signatures = webhookSignature.split(" ").map(sig => {
+    const parts = sig.split(",");
+    return parts.length > 1 ? parts[1] : parts[0];
+  });
+  return signatures.some(sig => {
+    try {
+      return crypto.timingSafeEqual(Buffer.from(expectedSignature), Buffer.from(sig));
+    } catch { return false; }
+  });
 }
 
 async function saveMemoryWithEmbedding(memory) {
@@ -151,3 +163,4 @@ server.on("error", (err) => {
   logJson("error", "fathom_webhook_server_error", { error: err.message });
   process.exit(1);
 });
+
