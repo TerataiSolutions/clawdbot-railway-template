@@ -5,11 +5,7 @@ import path from "node:path";
 
 const PORT = 4242;
 const WEBHOOK_SECRET = process.env.FATHOM_WEBHOOK_SECRET;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const COHERE_API_KEY = process.env.COHERE_API_KEY;
 const OPENCLAW_API_URL = process.env.OPENCLAW_API_URL || "http://localhost:8080/v1/chat/completions";
-const DISCORD_WEBHOOK_URL = process.env.AETHER_DISCORD_WEBHOOK_URL;
 
 let clientMap = {};
 try {
@@ -24,7 +20,7 @@ function logJson(level, message, data = {}) {
   console.log(JSON.stringify(log));
 }
 
-function verifySignature(req, body) {
+function verifySignature(req, rawBody) {
   const webhookId = req.headers["webhook-id"];
   const webhookTimestamp = req.headers["webhook-timestamp"];
   const webhookSignature = req.headers["webhook-signature"];
@@ -32,7 +28,7 @@ function verifySignature(req, body) {
   const timestamp = parseInt(webhookTimestamp, 10);
   const currentTimestamp = Math.floor(Date.now() / 1000);
   if (Math.abs(currentTimestamp - timestamp) > 300) return false;
-  const signedContent = `${webhookId}.${webhookTimestamp}.${body}`;
+  const signedContent = `${webhookId}.${webhookTimestamp}.${rawBody}`;
   const secretBytes = Buffer.from(WEBHOOK_SECRET.split("_")[1], "base64");
   const expectedSignature = crypto.createHmac("sha256", secretBytes).update(signedContent).digest("base64");
   const signatures = webhookSignature.split(" ").map(sig => {
@@ -82,8 +78,6 @@ function chunkTranscript(plainText, wordsPerChunk = 800) {
 }
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
-app.use(express.raw({ type: "application/octet-stream", limit: "10mb" }));
 
 app.post("/fathom/webhook", express.raw({ type: "application/json", limit: "10mb" }), async (req, res) => {
   try {
@@ -150,12 +144,10 @@ const server = app.listen(PORT, "127.0.0.1", () => {
 });
 
 process.on("SIGTERM", () => {
-  logJson("info", "fathom_webhook_shutdown_signal");
   server.close(() => process.exit(0));
 });
 
 process.on("SIGINT", () => {
-  logJson("info", "fathom_webhook_interrupt_signal");
   server.close(() => process.exit(0));
 });
 
@@ -163,5 +155,3 @@ server.on("error", (err) => {
   logJson("error", "fathom_webhook_server_error", { error: err.message });
   process.exit(1);
 });
-
-
