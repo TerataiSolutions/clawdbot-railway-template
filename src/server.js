@@ -805,6 +805,14 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"]) ]),
     );
 
+    // Set default model to deepseek-v4-pro with thinking mode enabled
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agents.defaults.model.primary", "deepseek/deepseek-v4-pro"]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "agents.defaults.model.models", JSON.stringify({
+      "deepseek/deepseek-v4-pro": { thinking: { type: "enabled" } },
+      "deepseek/deepseek-chat": {}
+    })]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "agents.defaults.model.fallbacks", JSON.stringify(["deepseek/deepseek-chat"])]));
+
     if (payload.customProviderId?.trim() && payload.customProviderBaseUrl?.trim()) {
       const providerId = payload.customProviderId.trim();
       const baseUrl = payload.customProviderBaseUrl.trim();
