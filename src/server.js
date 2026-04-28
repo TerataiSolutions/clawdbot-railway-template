@@ -359,10 +359,8 @@ app.post("/webhook", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
 
 // ── Fathom webhook proxy routes ──────────────────────────────────────
 
-app.post("/api/fathom/webhook", (req, res) => {
-  const bodyBuffer = req.body
-    ? Buffer.from(JSON.stringify(req.body))
-    : Buffer.alloc(0);
+app.post("/api/fathom/webhook", express.raw({ type: "application/json", limit: "10mb" }), (req, res) => {
+  const bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
   const options = {
     hostname: "127.0.0.1",
     port: 4242,
@@ -1484,4 +1482,5 @@ process.on("SIGTERM", () => {
 
   setTimeout(() => process.exit(0), 5_000).unref?.();
 });
+
 

@@ -85,21 +85,21 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 app.use(express.raw({ type: "application/octet-stream", limit: "10mb" }));
 
-app.post("/fathom/webhook", async (req, res) => {
+app.post("/fathom/webhook", express.raw({ type: "application/json", limit: "10mb" }), async (req, res) => {
   try {
+    const bodyString = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : (typeof req.body === "string" ? req.body : JSON.stringify(req.body));
+
     logJson("info", "webhook_request_received", {
-      body_length: JSON.stringify(req.body).length,
+      body_length: bodyString.length,
       content_type: req.headers["content-type"]
     });
-
-    const bodyString = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
 
     if (WEBHOOK_SECRET && !verifySignature(req, bodyString)) {
       logJson("warn", "fathom_webhook_invalid_signature");
       return res.status(401).json({ error: "Signature verification failed" });
     }
 
-    const payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const payload = JSON.parse(bodyString);
     const { title, transcript } = payload;
 
     if (!transcript || transcript.length === 0) {
@@ -163,4 +163,5 @@ server.on("error", (err) => {
   logJson("error", "fathom_webhook_server_error", { error: err.message });
   process.exit(1);
 });
+
 
