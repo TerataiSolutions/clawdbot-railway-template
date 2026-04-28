@@ -272,6 +272,32 @@ function requireSetupAuth(req, res, next) {
 
 const app = express();
 app.disable("x-powered-by");
+// Fathom webhook must be registered BEFORE express.json() to preserve raw body for signature verification
+app.post("/api/fathom/webhook", express.raw({ type: "application/json", limit: "10mb" }), (req, res) => {
+  const bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+  const options = {
+    hostname: "127.0.0.1",
+    port: 4242,
+    path: "/fathom/webhook",
+    method: "POST",
+    headers: {
+      ...req.headers,
+      "content-type": "application/json",
+      "content-length": bodyBuffer.length,
+    },
+  };
+  const proxyReq = http.request(options, (proxyRes) => {
+    res.statusCode = proxyRes.statusCode;
+    proxyRes.pipe(res);
+  });
+  proxyReq.on("error", (err) => {
+    console.error("[Fathom Proxy] Error:", err.message);
+    res.status(502).json({ error: "Webhook server unavailable" });
+  });
+  proxyReq.write(bodyBuffer);
+  proxyReq.end();
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 // Minimal health endpoint for Railway.
@@ -355,33 +381,6 @@ app.post("/webhook", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
     proxy.write(bodyBuffer);
     proxy.end();
   });
-});
-
-// ── Fathom webhook proxy routes ──────────────────────────────────────
-
-app.post("/api/fathom/webhook", express.raw({ type: "application/json", limit: "10mb" }), (req, res) => {
-  const bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
-  const options = {
-    hostname: "127.0.0.1",
-    port: 4242,
-    path: "/fathom/webhook",
-    method: "POST",
-    headers: {
-      ...req.headers,
-      "content-type": "application/json",
-      "content-length": bodyBuffer.length,
-    },
-  };
-  const proxyReq = http.request(options, (proxyRes) => {
-    res.statusCode = proxyRes.statusCode;
-    proxyRes.pipe(res);
-  });
-  proxyReq.on("error", (err) => {
-    console.error("[Fathom Proxy] Error:", err.message);
-    res.status(502).json({ error: "Webhook server unavailable" });
-  });
-  proxyReq.write(bodyBuffer);
-  proxyReq.end();
 });
 
 app.get("/api/fathom/health", (_req, res) => {
